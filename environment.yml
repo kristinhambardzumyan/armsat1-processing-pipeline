@@ -1,0 +1,30 @@
+name: roma
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - gdal
+  - rasterio
+  - geopandas
+  - shapely
+  - pyproj
+  - pyogrio
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - pillow
+  - tqdm
+  - requests
+  - scikit-learn
+  - scikit-image
+  - pip
+  - pip:
+      - earthengine-api
+      - opencv-python
+      - torch
+      - torchvision
+      - kornia
+      - einops
+      - timm
+      - romatch
