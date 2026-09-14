@@ -106,6 +106,75 @@ def expand_bbox(b, buf_deg):
     minLon, minLat, maxLon, maxLat = b
     return (minLon - buf_deg, minLat - buf_deg, maxLon + buf_deg, maxLat + buf_deg)
 
+REFERENCE_DIRECTION_OFFSETS = {
+    "NW": (-1, 1), "N": (0, 1), "NE": (1, 1),
+    "W": (-1, 0),                    "E": (1, 0),
+    "SW": (-1, -1), "S": (0, -1), "SE": (1, -1),
+}
+
+def reference_candidate_directions(config: dict | None) -> list[str]:
+    if not config:
+        return ["C"]
+    unknown = sorted(set(config) - {"overlap", "directions"})
+    if unknown:
+        raise ValueError(f"Unsupported multi_reference fields: {unknown}")
+    overlap = float(config.get("overlap", -1.0))
+    if not 0.0 <= overlap < 1.0:
+        raise ValueError("multi_reference overlap must satisfy 0 <= overlap < 1")
+    requested = config.get("directions")
+    if requested is not None and not isinstance(requested, list):
+        raise ValueError("multi_reference directions must be a JSON list")
+    directions = list(REFERENCE_DIRECTION_OFFSETS) if requested is None else [str(x).upper() for x in requested]
+    invalid = sorted(set(directions) - set(REFERENCE_DIRECTION_OFFSETS))
+    if invalid:
+        raise ValueError(f"Invalid multi_reference directions: {invalid}")
+    return ["C"] + list(dict.fromkeys(directions))
+
+def all_scene_reference_config(
+    enabled: bool,
+    overlap: float | None,
+    directions: list[str] | None,
+) -> dict | None:
+    """Build and validate one reference configuration for every running scene."""
+    if not enabled:
+        if overlap is not None or directions is not None:
+            raise ValueError(
+                "--multi_reference_overlap and --multi_reference_directions "
+                "require --multi_reference_all"
+            )
+        return None
+    if overlap is None:
+        raise ValueError("--multi_reference_all requires --multi_reference_overlap")
+    config = {"overlap": float(overlap)}
+    if directions is not None:
+        config["directions"] = directions
+    reference_candidate_directions(config)
+    return config
+
+def reference_download_bbox(center_bbox, config: dict | None, buffer_deg: float):
+    """Union the requested WGS84 neighbor extents, then add the usual buffer."""
+    if not config:
+        return expand_bbox(center_bbox, buffer_deg)
+    west, south, east, north = map(float, center_bbox)
+    reference_candidate_directions(config)
+    overlap = float(config["overlap"])
+    step_lon = (east - west) * (1.0 - overlap)
+    step_lat = (north - south) * (1.0 - overlap)
+    boxes = [(west, south, east, north)]
+    for direction in reference_candidate_directions(config)[1:]:
+        dx, dy = REFERENCE_DIRECTION_OFFSETS[direction]
+        boxes.append((
+            west + dx * step_lon,
+            south + dy * step_lat,
+            east + dx * step_lon,
+            north + dy * step_lat,
+        ))
+    union = (
+        min(box[0] for box in boxes), min(box[1] for box in boxes),
+        max(box[2] for box in boxes), max(box[3] for box in boxes),
+    )
+    return expand_bbox(union, buffer_deg)
+
 def time_window(scene_dt: datetime, window_days: int):
     return (
         (scene_dt - timedelta(days=window_days)).strftime("%Y-%m-%d"),
@@ -137,3 +206,50 @@ def gdal_warp_to_template_grid(in_path: Path, out_path: Path, template_tif: Path
         "-co", "COMPRESS=DEFLATE",
         in_path, out_path
     ])
+
+def gdal_warp_reference_candidates(
+    in_path: Path,
+    out_dir: Path,
+    template_tif: Path,
+    epsg: int,
+    config: dict,
+    dst_nodata=0,
+) -> list[dict]:
+    """Create same-sized, shifted reference grids around the center template."""
+    with rasterio.open(template_tif) as ds:
+        center = ds.bounds
+        width = ds.width
+        height = ds.height
+
+    overlap = float(config["overlap"])
+    step_x = (center.right - center.left) * (1.0 - overlap)
+    step_y = (center.top - center.bottom) * (1.0 - overlap)
+    candidates = [{
+        "direction": "C",
+        "path": "sentinel2_rgb_utm.tif",
+        "crop_bounds": [center.left, center.bottom, center.right, center.top],
+    }]
+
+    for direction in reference_candidate_directions(config)[1:]:
+        dx, dy = REFERENCE_DIRECTION_OFFSETS[direction]
+        bounds = (
+            center.left + dx * step_x,
+            center.bottom + dy * step_y,
+            center.right + dx * step_x,
+            center.top + dy * step_y,
+        )
+        out_path = out_dir / f"sentinel2_rgb_utm_ref_{direction}.tif"
+        run([
+            "gdalwarp", "-t_srs", f"EPSG:{epsg}",
+            "-te", *bounds, "-te_srs", f"EPSG:{epsg}",
+            "-ts", width, height,
+            "-r", "bilinear", "-dstnodata", str(dst_nodata),
+            "-overwrite", "-of", "GTiff", "-co", "COMPRESS=DEFLATE",
+            in_path, out_path,
+        ])
+        candidates.append({
+            "direction": direction,
+            "path": out_path.name,
+            "crop_bounds": list(bounds),
+        })
+    return candidates

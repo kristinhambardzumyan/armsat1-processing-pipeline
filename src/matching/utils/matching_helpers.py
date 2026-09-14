@@ -4,12 +4,17 @@ from pathlib import Path
 from typing import Any, Optional
 import cv2
 import numpy as np
-from src.matching.models.base import RawMatchSet, MatchResult, _fit_tps_rbf, _predict_tps
+import rasterio
+from matching.models.base import RawMatchSet, MatchResult, _fit_tps_rbf, _predict_tps
 
 def find_scene_inputs(scene_dir: Path) -> dict[str, Path]:
     armsat_candidates = sorted(scene_dir.glob("armsat_rgb_utm*.tif"))
     if not armsat_candidates:
-        raise FileNotFoundError(f"Missing ARMSAT UTM tif in {scene_dir}")
+        armsat_native = scene_dir / "armsat_rgb_native.tif"
+        if armsat_native.exists():
+            armsat_candidates = [armsat_native]
+    if not armsat_candidates:
+        raise FileNotFoundError(f"Missing ARMSAT RGB tif in {scene_dir}")
     armsat = armsat_candidates[0]
 
     s2_candidates = sorted(scene_dir.glob("sentinel2_rgb_utm*.tif"))
@@ -25,7 +30,39 @@ def find_scene_inputs(scene_dir: Path) -> dict[str, Path]:
 
     return {"armsat": armsat, "s2": s2}
 
-# Tiling utilities
+def find_scene_reference_candidates(scene_dir: Path) -> tuple[Path, list[dict[str, Any]]]:
+    """Return the moving image and configured reference crops (center first)."""
+    inputs = find_scene_inputs(scene_dir)
+    summary_path = scene_dir / "scene_prep_summary.json"
+    configured = None
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        configured = summary.get("multi_reference", {}).get("candidates")
+
+    if not configured:
+        with rasterio.open(inputs["s2"]) as ds:
+            bounds = [ds.bounds.left, ds.bounds.bottom, ds.bounds.right, ds.bounds.top]
+        return inputs["armsat"].resolve(), [{
+            "direction": "C",
+            "path": inputs["s2"].resolve(),
+            "crop_bounds": bounds,
+        }]
+
+    candidates: list[dict[str, Any]] = []
+    for item in configured:
+        path = Path(item["path"])
+        if not path.is_absolute():
+            path = scene_dir / path
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Missing configured reference candidate: {path}")
+        candidates.append({
+            "direction": str(item["direction"]).upper(),
+            "path": path,
+            "crop_bounds": [float(x) for x in item["crop_bounds"]],
+        })
+    return inputs["armsat"].resolve(), candidates
+
 def axis_starts(length: int, tile_size: int, overlap: int) -> list[int]:
     if tile_size <= 0:
         raise ValueError("tile_size must be > 0")
@@ -92,9 +129,6 @@ def build_large_context_ref_window(
         w_ref,
     )
 
-# Lightweight local tile filtering
-# This is only for tile-local cleanup before global merge.
-# The real chosen geometric filter is still done globally by matcher.filter_matches().
 def spatial_thin_matches(
     pts0: np.ndarray,
     pts1: np.ndarray,
@@ -195,7 +229,6 @@ def minimal_tile_filter(
         "n_after_spatial": n_after_spatial,
     }
 
-# Duplicate merge and coverage
 def merge_duplicate_matches_global(
     pts0: np.ndarray,
     pts1: np.ndarray,
@@ -258,11 +291,6 @@ def coverage_ratio(
     n_cells_y = max(1, int(np.ceil(h / cell_px)))
     return float(len(occupied)) / float(n_cells_x * n_cells_y)
 
-# Coarse prediction model for coarse-to-tile.
-# Uses the same independent selected model:
-#   tps -> TPS prediction
-#   affine_ransac -> affine prediction only
-#   homography_ransac -> homography prediction only
 def fit_coarse_prediction_model(
     pts0: np.ndarray,
     pts1: np.ndarray,
@@ -411,6 +439,7 @@ def save_matches_json(
         "n_matches_after_conf": mr.n_matches_after_conf,
         "n_matches_after_spatial": mr.n_matches_after_spatial,
         "n_matches_inliers": mr.n_matches_inliers,
+        "inlier_ratio": mr.inlier_ratio,
         "n_filter_iters": mr.n_filter_iters,
         "residual_median_px": mr.residual_median_px,
         "residual_p90_px": mr.residual_p90_px,
@@ -419,6 +448,16 @@ def save_matches_json(
     if extra:
         payload.update(extra)
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return p
+
+def save_reference_candidate_diagnostics(
+    out_aligned_dir: Path,
+    scene: str,
+    rows: list[dict[str, Any]],
+) -> Path:
+    p = out_aligned_dir / scene / "reference_candidates.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rows, indent=2), encoding="utf-8")
     return p
 
 def save_raw_matches_json(

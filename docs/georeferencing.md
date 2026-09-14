@@ -61,11 +61,15 @@ outputs/georeferencing/
     └── *_gcps.vrt
 ```
 
-A global report is additionally written:
+A global CSV/JSON report is additionally written:
 
 ```text
 georef_report.csv
+georef_report.json
 ```
+
+Parallel jobs also retain uniquely named per-job reports and merge their scene rows
+into these stable report files under a file lock.
 
 ---
 
@@ -148,17 +152,63 @@ export PYTHONPATH=$PWD/src
 
 ---
 
-# Main Arguments
+# Complete Georeferencing Argument Reference
 
-| Argument | Meaning |
-|---|---|
-| `--template_scenes_root` | Preprocessing scene directory |
-| `--original_scenes_root` | Original ArmSat-1 scenes |
-| `--aligned_root` | Matching output directory |
-| `--out_dir` | Georeferencing output directory |
-| `--min_gcps` | Minimum required GCPs |
-| `--max_gcps` | Maximum selected GCPs |
-| `--grid_size` | Grid size used for spatial balancing |
-| `--resampling` | GDAL resampling method |
+| Argument | Required | Default | Meaning |
+|---|---:|---|---|
+| `--template_scenes_root` | yes | — | Preprocessed scene root containing reference rasters |
+| `--original_scenes_root` | yes | — | Root containing original ArmSat bands |
+| `--aligned_root` | yes | — | Matching output root or its `aligned` directory |
+| `--out_dir` | yes | — | Georeferencing output directory |
+| `--scene` | no | `None` | Process one exact scene |
+| `--scene_list` | no | `None` | Process scenes from a text file; ignored when `--scene` is used |
+| `--min_gcps` | no | `12` | Minimum GCP count required to warp a scene |
+| `--max_gcps` | no | `1200` | Maximum spatially balanced GCPs selected |
+| `--grid_size` | no | `16` | Grid dimension used for spatial balancing |
+| `--min_conf_eval` | no | `0.0` | Minimum match confidence used for GCP selection |
+| `--resampling` | no | `bilinear` | GDAL resampling: `near`, `bilinear`, or `cubic` |
+| `--quiet` | no | off | Suppress verbose GDAL subprocess output |
 
+---
+
+# Multi-Reference Selection and Reports
+
+Multi-reference selection does not require a separate georeferencing argument.
+Georeferencing reads `selected_reference_candidate` from the scene's
+`matches_filtered.json` and uses that candidate GeoTIFF as the reference grid.
+When the field is absent, the original center-reference behavior remains in
+effect.
+
+The template lookup accepts `armsat_rgb_utm*.tif` and falls back to
+`armsat_rgb_native.tif` when preprocessing determined that the native raster was
+already in the requested UTM CRS. Scene-list entries may be either scene names or
+complete scene-directory paths.
+
+Parallel georeferencing processes write uniquely named per-process CSV and JSON
+reports. The stable `georef_report.csv` and `georef_report.json` are merged under
+a file lock and replaced atomically, so one process cannot erase another
+process's scene rows.
+
+After georeferencing, selected-reference versus output previews can be generated
+with:
+
+```bash
+python scripts/make_georef_side_by_side.py \
+  --preprocessing_scenes_root outputs/preprocessing/scenes \
+  --matching_aligned_root outputs/matching/aligned \
+  --georeferencing_root outputs/georeferencing \
+  --out_dir outputs/georeferencing_side_by_side \
+  --scene_list /path/to/scenes.txt \
+  --max_side 900
 ```
+
+Preview arguments:
+
+| Argument | Required | Default | Meaning |
+|---|---:|---|---|
+| `--preprocessing_scenes_root` | yes | — | Prepared scene directories containing reference candidates |
+| `--matching_aligned_root` | yes | — | Matching `aligned` directory containing `matches_filtered.json` |
+| `--georeferencing_root` | yes | — | Final georeferencing output directory |
+| `--out_dir` | yes | — | Destination for JPEGs and `side_by_side_report.json` |
+| `--scene_list` | no | `None` | Optional scene-name/path list |
+| `--max_side` | no | `900` | Maximum panel dimension |

@@ -1,0 +1,9 @@
+{
+  "FULL_SCENE_NAME_001": {
+    "overlap": 0.5
+  },
+  "FULL_SCENE_NAME_057": {
+    "overlap": 0.5,
+    "directions": ["W", "NW", "N"]
+  }
+}
