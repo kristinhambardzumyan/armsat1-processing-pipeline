@@ -25,7 +25,7 @@ from matching.models.base import RawMatchSet
 from matching.utils.matching_helpers import (
     add_tps_args,
     filter_kwargs_from_args,
-    find_scene_inputs,
+    find_scene_reference_candidates,
     fit_coarse_prediction_model,
     generate_tiles,
     is_bad_geometry,
@@ -34,6 +34,7 @@ from matching.utils.matching_helpers import (
     predict_points_with_coarse_model,
     predict_ref_window_from_coarse_model,
     save_matches_json,
+    save_reference_candidate_diagnostics,
     save_tile_diagnostics,
     save_raw_matches_json,
 )
@@ -129,11 +130,11 @@ def tile_worker_main(payload_path: str) -> None:
         payload = json.load(f)
 
     args = argparse.Namespace(**payload["args"])
-    scene = str(payload["scene"])
-    scene_dir = Path(payload["scene_dir"])
     result_path = Path(payload["result_path"])
     tile_sample_num = int(payload["tile_sample_num"])
     tile_specs = payload["tiles"]
+    armsat_path = Path(payload["armsat_path"])
+    reference_path = Path(payload["reference_path"])
 
     set_reproducibility(int(getattr(args, "seed", 42)), deterministic_cudnn=bool(getattr(args, "deterministic_cudnn", True)))
 
@@ -142,16 +143,14 @@ def tile_worker_main(payload_path: str) -> None:
     results: list[dict[str, Any]] = []
 
     try:
-        inp = find_scene_inputs(scene_dir)
         gp = load_armsat_and_buffered_sentinel_for_matching(
-            armsat_path=inp["armsat"],
-            s2_path=inp["s2"],
+            armsat_path=armsat_path,
+            s2_path=reference_path,
             out_nodata=-9999.0,
         )
         matcher = make_roma_matcher(args, sample_num=tile_sample_num)
 
         for spec in tile_specs:
-            tile_id = int(spec["tile_id"])
             y0, y1, x0, x1 = [int(v) for v in spec["tile_window_yx"]]
             ry0, ry1, rx0, rx1 = [int(v) for v in spec["pred_ref_window_yx"]]
             row = dict(spec["row"])
@@ -216,6 +215,8 @@ def run_tile_worker_batch(
     args: argparse.Namespace,
     scene: str,
     scene_dir: Path,
+    armsat_path: Path,
+    reference_path: Path,
     tile_specs: list[dict[str, Any]],
     tile_sample_num: int,
     tmp_dir: Path,
@@ -229,6 +230,8 @@ def run_tile_worker_batch(
         "args": vars(args),
         "scene": scene,
         "scene_dir": str(scene_dir),
+        "armsat_path": str(armsat_path),
+        "reference_path": str(reference_path),
         "tile_sample_num": int(tile_sample_num),
         "tiles": tile_specs,
         "result_path": str(result_path),
@@ -313,7 +316,6 @@ def main() -> None:
     args = build_parser().parse_args()
     set_reproducibility(args.seed, deterministic_cudnn=args.deterministic_cudnn)
 
-    # Final production choice: fixed homography coarse model and final TPS filter.
     args.coarse_filter_model = "homography_ransac"
     args.final_filter_model = "tps"
     final_filter_models = ["tps"]
@@ -340,22 +342,95 @@ def main() -> None:
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
 
-            inp = find_scene_inputs(sd)
-            gp = load_armsat_and_buffered_sentinel_for_matching(
-                armsat_path=inp["armsat"],
-                s2_path=inp["s2"],
-                out_nodata=-9999.0,
-            )
+            armsat_path, reference_candidates = find_scene_reference_candidates(sd)
+            candidate_diagnostics: list[dict[str, Any]] = []
+            selected = None
 
-            coarse_raw = matcher.infer_raw(
-                gp.mov_img01,
-                gp.ref_img01,
-                gp.mov_valid,
-                gp.ref_valid,
-                sample_num=args.roma_sample_num,
+            for candidate in reference_candidates:
+                candidate_gp = candidate_raw = candidate_mr = None
+                diagnostic = {
+                    "direction": candidate["direction"],
+                    "crop_bounds": candidate["crop_bounds"],
+                    "reference_path": str(candidate["path"]),
+                    "match_count": 0,
+                    "inlier_count": 0,
+                    "inlier_ratio": None,
+                    "selected": False,
+                }
+                try:
+                    candidate_gp = load_armsat_and_buffered_sentinel_for_matching(
+                        armsat_path=armsat_path,
+                        s2_path=candidate["path"],
+                        out_nodata=-9999.0,
+                    )
+                    candidate_raw = matcher.infer_raw(
+                        candidate_gp.mov_img01,
+                        candidate_gp.ref_img01,
+                        candidate_gp.mov_valid,
+                        candidate_gp.ref_valid,
+                        sample_num=args.roma_sample_num,
+                    )
+                    candidate_raw = raw_matchset_to_cpu(candidate_raw)
+                    diagnostic["match_count"] = int(len(candidate_raw.conf))
+                    candidate_mr = matcher.filter_matches(
+                        candidate_raw,
+                        image_shape=candidate_gp.ref_img01.shape[:2],
+                        conf_keep_pct=args.coarse_conf_keep_pct,
+                        min_conf=args.coarse_min_conf,
+                        min_matches=args.coarse_min_matches,
+                        spatial_cell_px=args.coarse_spatial_cell_px,
+                        spatial_max_per_cell=args.coarse_spatial_max_per_cell,
+                        min_export_matches=args.min_export_matches,
+                        **filter_kwargs_from_args(args, filter_model=args.coarse_filter_model),
+                    )
+                    diagnostic["inlier_count"] = int(candidate_mr.n_matches_inliers)
+                    diagnostic["inlier_ratio"] = candidate_mr.inlier_ratio
+                    diagnostic["status"] = "ok" if candidate_mr.exportable else "rejected"
+                    diagnostic["reason"] = candidate_mr.reason
+
+                    viable = (
+                        candidate_mr.exportable
+                        and candidate_mr.pts0 is not None
+                        and candidate_mr.pts1 is not None
+                        and candidate_mr.conf is not None
+                    )
+                    if viable and (selected is None or candidate_mr.n_matches_inliers > selected["mr"].n_matches_inliers):
+                        if selected is not None:
+                            del selected["gp"], selected["raw"], selected["mr"]
+                        selected = {
+                            "candidate": candidate,
+                            "gp": candidate_gp,
+                            "raw": candidate_raw,
+                            "mr": candidate_mr,
+                            "diagnostic": diagnostic,
+                        }
+                        candidate_gp = candidate_raw = candidate_mr = None
+                except Exception as candidate_error:
+                    diagnostic["status"] = "error"
+                    diagnostic["reason"] = repr(candidate_error)
+                finally:
+                    candidate_diagnostics.append(diagnostic)
+                    try:
+                        del candidate_gp, candidate_raw, candidate_mr
+                    except Exception:
+                        pass
+                    cleanup_cuda()
+
+            if selected is None:
+                save_reference_candidate_diagnostics(out_aligned_dir, scene, candidate_diagnostics)
+                n_failed += 1
+                print(f"[SKIP] {scene}: all reference candidates failed coarse verification", flush=True)
+                continue
+
+            selected["diagnostic"]["selected"] = True
+            selected_candidate = selected["candidate"]
+            gp = selected["gp"]
+            coarse_raw = selected["raw"]
+            coarse_mr = selected["mr"]
+            out_candidate_json = save_reference_candidate_diagnostics(
+                out_aligned_dir, scene, candidate_diagnostics
             )
-            coarse_raw = raw_matchset_to_cpu(coarse_raw)
-            cleanup_cuda()
+            del selected
 
             save_raw_matches_json(
                 out_aligned_dir,
@@ -365,29 +440,14 @@ def main() -> None:
                 gp.ref_img01.shape[:2],
                 stage_name="coarse",
                 grid_strategy="roma_homography_tps_coarse_raw_before_filtering",
+                extra={
+                    "selected_reference_candidate": {
+                        "direction": selected_candidate["direction"],
+                        "crop_bounds": selected_candidate["crop_bounds"],
+                        "reference_path": str(selected_candidate["path"]),
+                    }
+                },
             )
-
-            coarse_mr = matcher.filter_matches(
-                coarse_raw,
-                image_shape=gp.ref_img01.shape[:2],
-                conf_keep_pct=args.coarse_conf_keep_pct,
-                min_conf=args.coarse_min_conf,
-                min_matches=args.coarse_min_matches,
-                spatial_cell_px=args.coarse_spatial_cell_px,
-                spatial_max_per_cell=args.coarse_spatial_max_per_cell,
-                min_export_matches=args.min_export_matches,
-                **filter_kwargs_from_args(args, filter_model=args.coarse_filter_model),
-            )
-
-            if not (
-                coarse_mr.exportable
-                and coarse_mr.pts0 is not None
-                and coarse_mr.pts1 is not None
-                and coarse_mr.conf is not None
-            ):
-                n_failed += 1
-                print(f"[SKIP] {scene}: coarse stage failed: {coarse_mr.reason}", flush=True)
-                continue
 
             coarse_model_type, coarse_model, coord_scale = fit_coarse_prediction_model(
                 coarse_mr.pts0,
@@ -505,6 +565,8 @@ def main() -> None:
                     args=args,
                     scene=scene,
                     scene_dir=sd,
+                    armsat_path=armsat_path,
+                    reference_path=selected_candidate["path"],
                     tile_specs=batch_specs,
                     tile_sample_num=int(tile_sample_num),
                     tmp_dir=tmp_worker_dir,
@@ -773,6 +835,12 @@ def main() -> None:
                         "coarse_config": coarse_config,
                         "refine_config": refine_config,
                         "scene_diagnostics": scene_diagnostics,
+                        "reference_candidates": candidate_diagnostics,
+                        "selected_reference_candidate": {
+                            "direction": selected_candidate["direction"],
+                            "crop_bounds": selected_candidate["crop_bounds"],
+                            "reference_path": str(selected_candidate["path"]),
+                        },
                     },
                 )
 
@@ -785,7 +853,8 @@ def main() -> None:
                     f"refine_matches={scene_diagnostics['tile_refine_stage']['n_refine_matches_total']} | "
                     f"premerge={premerge_match_count} | merged={merged_match_count} | final={len(final_mr.conf)} | "
                     f"med={final_mr.residual_median_px:.3f} | p90={final_mr.residual_p90_px:.3f} | "
-                    f"out={out_json.name} | tiles={out_tile_json.name}",
+                    f"reference={selected_candidate['direction']} | out={out_json.name} | "
+                    f"tiles={out_tile_json.name} | candidates={out_candidate_json.name}",
                     flush=True,
                 )
 
@@ -802,7 +871,7 @@ def main() -> None:
             except Exception:
                 pass
             try:
-                del tiles, tile_specs, refine_pts0, refine_pts1, refine_conf, tile_rows
+                del tiles, refine_pts0, refine_pts1, refine_conf, tile_rows
             except Exception:
                 pass
             try:

@@ -6,7 +6,7 @@ import gc
 import cv2
 import numpy as np
 import torch
-from src.matching.models.base import BaseMatcher, MatchResult, RawMatchSet
+from matching.models.base import BaseMatcher, MatchResult, RawMatchSet
 
 class RoMaMatcher(BaseMatcher):
     method_name = "roma"
@@ -134,8 +134,7 @@ class RoMaMatcher(BaseMatcher):
                         w1,
                     )
 
-                    # CRITICAL: move outputs to CPU while still inside inference_mode,
-                    # then immediately drop every CUDA tensor created by RoMa.
+                    # Move outputs to CPU before leaving inference mode.
                     pts0 = kpts0.detach().cpu().numpy().astype(np.float32, copy=False)
                     pts1 = kpts1.detach().cpu().numpy().astype(np.float32, copy=False)
                     conf = certainty_s.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
@@ -144,7 +143,7 @@ class RoMaMatcher(BaseMatcher):
                 del warp, certainty, matches, certainty_s, kpts0, kpts1
                 self._cleanup_cuda()
 
-        # Drop CPU image buffers too; these can be large for tiled runs.
+        # Release large CPU image buffers after tiled inference.
         del mov_rgb, ref_rgb
 
         if pts0.shape[0] != pts1.shape[0] or pts0.shape[0] != conf.shape[0]:

@@ -354,9 +354,8 @@ class BaseMatcher:
         spatial_cell_px: int = 128,
         spatial_max_per_cell: int = 8,
         min_export_matches: int = 12,
-        filter_model: str = "tps",  # "tps", "affine_ransac", "homography_ransac"
+        filter_model: str = "tps",
 
-        # TPS-only parameters.
         min_tps_matches_total: int = 12,
         min_tps_train_matches_per_fold: int = 8,
         tps_smoothing: float = 1e-3,
@@ -367,7 +366,6 @@ class BaseMatcher:
         cv_block_px: int = 256,
         cv_max_folds: int = 4,
 
-        # RANSAC-only parameters.
         ransac_reproj_thresh_px: float = 8.0,
         ransac_confidence: float = 0.999,
         ransac_max_iters: int = 5000,

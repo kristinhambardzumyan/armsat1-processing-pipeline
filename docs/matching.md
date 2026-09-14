@@ -46,6 +46,7 @@ outputs/matching/roma_homography_tps_2024/
     └── <scene_name>/
         ├── matches_filtered.json
         ├── matches_raw_*.json
+        ├── reference_candidates.json
         └── tile_diagnostics*.csv/json
 ```
 
@@ -56,6 +57,13 @@ matches_filtered.json
 ```
 
 This file contains the final filtered correspondences used during georeferencing.
+
+When preprocessing configured multiple references, the existing coarse matching and
+geometric verification are applied to each crop. The candidate with the largest
+coarse inlier count is selected (the center wins ties), and the existing tile and TPS
+stages continue with that crop. `reference_candidates.json` and
+`matches_filtered.json` record each direction, crop bounds, initial match count,
+inlier count, inlier ratio, and the selected candidate.
 
 ---
 
@@ -137,20 +145,110 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ---
 
-# Main Arguments
+# Complete Argument Reference
 
-| Argument | Meaning |
-|---|---|
-| `--scenes_root` | Directory containing preprocessed scene folders |
-| `--out_dir` | Output directory for matching results |
-| `--roma_variant` | RoMa model variant |
-| `--roma_sample_num` | Number of coarse matching samples |
-| `--roma_sample_num_tile` | Number of tile-level matching samples |
-| `--ransac_reproj_thresh_px` | Homography RANSAC reprojection threshold |
-| `--tile_size` | Tile size used for local refinement |
-| `--tile_overlap` | Overlap between neighboring tiles |
-| `--refine_margin_px` | Margin around predicted reference windows |
-| `--final_min_matches` | Minimum matches required for export |
-| `--max_export_median_px` | Maximum allowed median residual |
-| `--max_export_p90_px` | Maximum allowed 90th-percentile residual |
+Inputs, reproducibility, and RoMa:
+
+| Argument | Required | Default | Meaning |
+|---|---:|---|---|
+| `--scenes_root` | yes | — | Root containing preprocessed scene directories |
+| `--out_dir` | yes | — | Matching output root |
+| `--seed` | no | `42` | Random seed |
+| `--no_deterministic_cudnn` | no | off | Disable deterministic cuDNN settings |
+| `--roma_variant` | no | `outdoor` | RoMa weights: `outdoor` or `indoor` |
+| `--roma_sample_num` | no | `12000` | Coarse-stage sample count |
+| `--roma_sample_num_tile` | no | `None` | Tile sample count; reuses the coarse count when omitted |
+| `--roma_sample_thresh` | no | `None` | Optional RoMa sampling threshold |
+| `--roma_device` | no | `None` | Explicit PyTorch device; automatically selected when omitted |
+| `--roma_w_resized` | no | `1120` | RoMa resized input width |
+| `--roma_h_resized` | no | `1120` | RoMa resized input height |
+| `--roma_upsample_w` | no | `1120` | RoMa upsample width |
+| `--roma_upsample_h` | no | `1120` | RoMa upsample height |
+
+Coarse verification and TPS:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--coarse_conf_keep_pct` | `60` | Coarse confidence percentage retained |
+| `--coarse_min_conf` | `0.20` | Minimum coarse confidence |
+| `--coarse_min_matches` | `80` | Preferred minimum before coarse filtering |
+| `--coarse_spatial_cell_px` | `128` | Coarse spatial-balancing cell size |
+| `--coarse_spatial_max_per_cell` | `8` | Maximum coarse matches per cell |
+| `--min_export_matches` | `12` | Absolute minimum exportable match count |
+| `--min_tps_matches_total` | `12` | Minimum matches required for TPS fitting |
+| `--min_tps_train_matches_per_fold` | `8` | Minimum TPS training matches per fold |
+| `--tps_smoothing` | `1e-3` | TPS smoothing parameter |
+| `--tps_abs_thresh_px` | `6.0` | Absolute TPS residual threshold in pixels |
+| `--tps_mad_mult` | `3.0` | MAD multiplier for the adaptive TPS threshold |
+| `--tps_max_iters` | `5` | Maximum TPS filtering iterations |
+| `--tps_max_remove_frac` | `0.20` | Maximum fraction removed per TPS iteration |
+| `--cv_block_px` | `256` | Spatial cross-validation block size |
+| `--cv_max_folds` | `4` | Maximum cross-validation folds |
+| `--ransac_reproj_thresh_px` | `8.0` | Homography RANSAC reprojection threshold |
+| `--ransac_confidence` | `0.999` | RANSAC confidence |
+| `--ransac_max_iters` | `5000` | Maximum RANSAC iterations |
+| `--ransac_refine_iters` | `10` | Homography refinement iterations |
+
+Tile refinement, merging, and export:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--tile_size` | `1120` | Tile width and height in pixels |
+| `--tile_overlap` | `64` | Overlap between adjacent tiles |
+| `--tile_min_valid_frac` | `0.05` | Minimum valid-data fraction per tile |
+| `--tile_min_side_px` | `256` | Minimum accepted tile side length |
+| `--refine_margin_px` | `256` | Margin around the predicted reference window |
+| `--tile_conf_keep_pct` | `60` | Tile confidence percentage retained |
+| `--tile_min_conf` | `0.20` | Minimum tile confidence |
+| `--tile_spatial_cell_px` | `128` | Tile-stage spatial-balancing cell size |
+| `--tile_spatial_max_per_cell` | `4` | Maximum tile matches per cell |
+| `--tile_prior_consistency_px` | `64.0` | Maximum deviation from the coarse prediction |
+| `--tile_worker_batch_size` | `4` | Tiles handled by each short-lived worker |
+| `--merge_src_round_px` | `0.5` | Source-coordinate rounding for deduplication |
+| `--merge_dst_round_px` | `0.5` | Reference-coordinate rounding for deduplication |
+| `--final_conf_keep_pct` | `60` | Final confidence percentage retained |
+| `--final_min_conf` | `0.20` | Minimum final confidence |
+| `--final_min_matches` | `80` | Preferred minimum before final filtering |
+| `--final_spatial_cell_px` | `128` | Final spatial-balancing cell size |
+| `--final_spatial_max_per_cell` | `8` | Maximum final matches per cell |
+| `--max_export_median_px` | `10.0` | Maximum accepted median residual |
+| `--max_export_p90_px` | `30.0` | Maximum accepted 90th-percentile residual |
+| `--save_all` | off | Save results that exceed residual quality limits |
+
+---
+
+# Multi-Reference Matching
+
+There is no additional matching command-line argument. Matching discovers the
+candidate list written by preprocessing in each scene's
+`scene_prep_summary.json`. A scene without that metadata follows the original
+single-reference path.
+
+For every configured candidate, the existing RoMa coarse matcher and existing
+geometric filter compute:
+
+- candidate direction and crop bounds;
+- initial match count;
+- geometrically verified inlier count;
+- inlier ratio and rejection status.
+
+The viable candidate with the largest inlier count is marked as selected. Only
+that candidate proceeds through the existing tile refinement, merge, final
+filtering, and TPS path, avoiding duplicate refinement logic and unnecessary work
+for candidates that were not selected.
+
+Candidate evaluation is written to:
+
+```text
+<out_dir>/aligned/<scene>/reference_candidates.json
 ```
+
+The same candidate diagnostics and a `selected_reference_candidate` object are
+also included in `matches_filtered.json`. The selected object contains
+`direction`, `crop_bounds`, and `reference_path`; georeferencing consumes it
+automatically.
+
+Both `armsat_rgb_utm*.tif` and an already-UTM `armsat_rgb_native.tif` are accepted
+as the ArmSat matching input. This fallback is important for preprocessing runs
+where reprojection was unnecessary and therefore no separate `_utm` file was
+created.

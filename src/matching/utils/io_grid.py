@@ -21,8 +21,8 @@ class GridPair:
 
 def _read_rgb(path: Path):
     with rasterio.open(path) as ds:
-        arr = ds.read([1, 2, 3])  # (3, H, W)
-        arr = np.transpose(arr, (1, 2, 0))  # (H, W, 3)
+        arr = ds.read([1, 2, 3])
+        arr = np.transpose(arr, (1, 2, 0))
         meta = ds.meta.copy()
         nodata = ds.nodata
         crs = ds.crs
@@ -34,7 +34,7 @@ def _read_rgb(path: Path):
     return arr.astype(np.float32), meta, nodata, crs, transform
 
 def _rgb_to_gray(arr: np.ndarray) -> np.ndarray:
-    # Float grayscale, no uint8 clipping
+    # Preserve floating-point grayscale values without clipping.
     r = arr[..., 0].astype(np.float32)
     g = arr[..., 1].astype(np.float32)
     b = arr[..., 2].astype(np.float32)
@@ -60,7 +60,7 @@ def _cleanup_reprojected_2d(x: np.ndarray, out_nodata: float, src_nodata: Option
     if src_nodata is not None:
         x[x == float(src_nodata)] = float(out_nodata)
 
-    # Catch broken nodata artifacts after reprojection / dtype conversion
+    # Catch invalid nodata values after reprojection or type conversion.
     x[x < -1e6] = float(out_nodata)
     x[x > 1e20] = float(out_nodata)
 

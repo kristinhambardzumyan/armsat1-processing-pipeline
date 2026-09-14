@@ -8,9 +8,10 @@ from datetime import datetime
 
 from preprocessing.geo import (
     run, is_band_tif, scene_key, pick_driver, parse_armsat_date,
-    bbox_wgs84, expand_bbox, time_window,
+    bbox_wgs84, time_window,
     gdal_reproject, gdal_warp_to_template_grid,
-    build_armsat_rgb
+    build_armsat_rgb, gdal_warp_reference_candidates,
+    reference_download_bbox, all_scene_reference_config,
 )
 
 from preprocessing.s2_gee import (
@@ -34,6 +35,7 @@ def process_one_scene(
     gee_composite: str,
     gee_download_mode: str,
     drive_folder: str,
+    multi_reference: dict | None = None,
 ) -> dict:
     out_scene.mkdir(parents=True, exist_ok=True)
 
@@ -41,16 +43,13 @@ def process_one_scene(
     if not armsat_dt:
         raise RuntimeError(f"Cannot parse date from scene: {scene}")
 
-    # Build ArmSat RGB native
     armsat_rgb_native = out_scene / "armsat_rgb_native.tif"
     armsat_rgb_native, rgb_info = build_armsat_rgb(scene_paths, armsat_rgb_native)
 
-    # bbox + time window
     b = bbox_wgs84(driver)
-    b_exp = expand_bbox(b, buffer_deg)
+    b_exp = reference_download_bbox(b, multi_reference, buffer_deg)
     start, end = time_window(armsat_dt, window_days)
 
-    # ArmSat RGB -> UTM
     with rasterio.open(armsat_rgb_native) as ds:
         src_epsg = ds.crs.to_epsg() if ds.crs else None
 
@@ -64,7 +63,6 @@ def process_one_scene(
         native_xres = abs(ds.transform.a)
         native_yres = abs(ds.transform.e)
 
-    # Sentinel-2 RGB mosaic from GEE: local direct download or Drive export
     gee_tif = out_scene / "sentinel2_rgb_raw.tif"
 
     if gee_download_mode == "local":
@@ -102,7 +100,6 @@ def process_one_scene(
             "scene_dir": str(out_scene),
         }
 
-    # Warp Sentinel-2 RGB to exact ArmSat UTM grid
     out_clip = out_scene / "sentinel2_rgb_utm.tif"
     gdal_warp_to_template_grid(
         gee_tif,
@@ -111,6 +108,17 @@ def process_one_scene(
         utm_epsg,
         dst_nodata=0
     )
+
+    reference_candidates = None
+    if multi_reference:
+        reference_candidates = gdal_warp_reference_candidates(
+            in_path=gee_tif,
+            out_dir=out_scene,
+            template_tif=out_clip,
+            epsg=utm_epsg,
+            config=multi_reference,
+            dst_nodata=0,
+        )
 
     summary = {
         "scene": scene,
@@ -151,6 +159,12 @@ def process_one_scene(
         "dstnodata": 0,
         "grid_strategy": "gee_sentinel2_rgb_10m_direct_download_then_warp_to_native_armsat_grid",
     }
+    if multi_reference:
+        summary["multi_reference"] = {
+            "overlap": float(multi_reference["overlap"]),
+            "directions": [c["direction"] for c in reference_candidates if c["direction"] != "C"],
+            "candidates": reference_candidates,
+        }
 
     (out_scene / "scene_prep_summary.json").write_text(
         json.dumps(summary, indent=2),
@@ -169,7 +183,6 @@ def main():
     ap.add_argument("--resolution", type=float, default=10.0)
     ap.add_argument("--prefer_band", choices=["R", "G", "B", "N"], default="R")
 
-    # GEE arguments
     ap.add_argument("--gee_project", default=None)
     ap.add_argument("--max_cloud_pct", type=float, default=100.0)
     ap.add_argument(
@@ -188,7 +201,6 @@ def main():
         default="armsat_sentinel_exports",
     )
 
-    # Batching arguments
     ap.add_argument("--start_idx", type=int, default=0)
     ap.add_argument("--end_idx", type=int, default=None)
     ap.add_argument(
@@ -196,7 +208,42 @@ def main():
         default=None,
         help="Optional txt file with one scene name per line. If provided, only these scenes are processed.",
     )
+    multi_reference_mode = ap.add_mutually_exclusive_group()
+    multi_reference_mode.add_argument(
+        "--multi_reference_config",
+        default=None,
+        help="Optional JSON file mapping selected scene names to overlap/directions settings.",
+    )
+    multi_reference_mode.add_argument(
+        "--multi_reference_all",
+        action="store_true",
+        help="Apply one overlap/directions configuration to every scene processed in this run.",
+    )
+    ap.add_argument(
+        "--multi_reference_overlap",
+        type=float,
+        default=None,
+        help="Neighbor overlap used with --multi_reference_all.",
+    )
+    ap.add_argument(
+        "--multi_reference_directions",
+        nargs="+",
+        default=None,
+        help="Optional neighbor directions used with --multi_reference_all; omit for all eight.",
+    )
     args = ap.parse_args()
+
+    global_multi_reference = all_scene_reference_config(
+        args.multi_reference_all,
+        args.multi_reference_overlap,
+        args.multi_reference_directions,
+    )
+    multi_reference_by_scene = {}
+    if args.multi_reference_config:
+        config_path = Path(args.multi_reference_config)
+        multi_reference_by_scene = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(multi_reference_by_scene, dict):
+            raise ValueError("multi_reference_config must contain a JSON object keyed by scene name")
 
     run(["gdalwarp", "--version"], check=True)
 
@@ -206,7 +253,6 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Logging
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
 
@@ -243,10 +289,11 @@ def main():
     if args.scene_list:
         scene_list_path = Path(args.scene_list)
         wanted_scenes = [
-            line.strip()
+            Path(line.strip().rstrip("/")).name
             for line in scene_list_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
+            if line.strip() and not line.lstrip().startswith("#")
         ]
+        wanted_scenes = list(dict.fromkeys(wanted_scenes))
 
         missing = [s for s in wanted_scenes if s not in groups]
         if missing:
@@ -282,6 +329,7 @@ def main():
                 gee_composite=args.gee_composite,
                 gee_download_mode=args.gee_download_mode,
                 drive_folder=args.drive_folder,
+                multi_reference=global_multi_reference or multi_reference_by_scene.get(scene),
             )
 
             reporter.add({

@@ -1,6 +1,5 @@
 from __future__ import annotations
 import argparse
-import csv
 import json
 import subprocess
 from pathlib import Path
@@ -8,6 +7,7 @@ from typing import List, Tuple
 import numpy as np
 import rasterio
 from pyproj import Transformer
+from preprocessing.report import RunReport
 
 GCP = Tuple[float, float, float, float, float]
 
@@ -189,7 +189,6 @@ def warp_with_tps(
         cmd += ["-dstnodata", str(dst_nodata)]
     cmd += [
         "-of", "GTiff",
-        # "-co", "COMPRESS=DEFLATE",
         "-co", "TILED=YES",
         "-co", "BIGTIFF=IF_SAFER",
         src_with_gcps,
@@ -221,9 +220,9 @@ def resolve_scene_list(args, template_scenes_root: Path) -> list[str]:
 
     if args.scene_list:
         return [
-            x.strip()
+            Path(x.strip().rstrip("/")).name
             for x in Path(args.scene_list).read_text(encoding="utf-8").splitlines()
-            if x.strip()
+            if x.strip() and not x.lstrip().startswith("#")
         ]
     return sorted([p.name for p in template_scenes_root.iterdir() if p.is_dir()])
 
@@ -305,16 +304,28 @@ def main():
                 continue
 
             ref_template_candidates = sorted(template_scene_dir.glob("armsat_rgb_utm*.tif"))
+            if not ref_template_candidates:
+                armsat_native = template_scene_dir / "armsat_rgb_native.tif"
+                if armsat_native.exists():
+                    ref_template_candidates = [armsat_native]
 
             if not ref_template_candidates:
                 row["status"] = "skipped"
-                row["reason"] = "missing_armsat_rgb_utm_template"
-                print(f"[SKIP] {scene}: no armsat_rgb_utm*.tif")
+                row["reason"] = "missing_armsat_rgb_template"
+                print(f"[SKIP] {scene}: no ArmSat RGB template")
                 report_rows.append(row)
                 continue
 
             ref_template = ref_template_candidates[0]
             pts_mov, pts_ref, conf, match_data = read_matches(matches_json)
+            selected_reference = match_data.get("selected_reference_candidate")
+            if selected_reference:
+                selected_path = Path(selected_reference["reference_path"])
+                if not selected_path.exists():
+                    selected_path = template_scene_dir / selected_path.name
+                if not selected_path.exists():
+                    raise FileNotFoundError(f"Selected matching reference no longer exists: {selected_path}")
+                ref_template = selected_path
             row["matches_total"] = int(len(conf))
 
             if len(conf) < args.min_gcps:
@@ -444,6 +455,7 @@ def main():
                 "matching_residual_median_px": match_data.get("residual_median_px"),
                 "matching_residual_p90_px": match_data.get("residual_p90_px"),
                 "matching_final_inliers": match_data.get("n_matches_inliers"),
+                "selected_reference_candidate": selected_reference,
             }
 
             (scene_out / "georef_metadata.json").write_text(
@@ -465,15 +477,14 @@ def main():
 
         report_rows.append(row)
 
-    report_path = out_dir / "georef_report.csv"
-
-    with report_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(report_rows)
+    reporter = RunReport(out_dir=out_dir, name_prefix="georef_report")
+    for report_row in report_rows:
+        reporter.add(report_row)
+    report_path, report_json_path = reporter.write()
 
     print("\n[OUTPUT]")
     print(f"Report: {report_path}")
+    print(f"JSON report: {report_json_path}")
     print(f"Successful scenes: {sum(r['status'] == 'success' for r in report_rows)}")
     print(f"Failed/skipped scenes: {sum(r['status'] != 'success' for r in report_rows)}")
 
